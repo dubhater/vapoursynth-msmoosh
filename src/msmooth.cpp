@@ -10,8 +10,8 @@ typedef struct {
     VSNodeRef *node;
     const VSVideoInfo *vi;
 
-    int threshold;
-    int strength;
+    double threshold;
+    double strength;
     int mask;
     int process[3];
 } MSmoothData;
@@ -161,6 +161,16 @@ static inline void copyMask(void *dstpv, const void *srcpv, int dst_stride, int 
 }
 
 
+static inline int clamp(int val, int minimum, int maximum) {
+    if (val < minimum)
+        val = minimum;
+    else if (val > maximum)
+        val = maximum;
+
+    return val;
+}
+
+
 template <typename T, bool rgb>
 static void edgeMask(VSFrameRef *mask, const VSFrameRef *src, MSmoothData *d, const VSAPI *vsapi) {
     const uint8_t *srcp[3];
@@ -187,8 +197,11 @@ static void edgeMask(VSFrameRef *mask, const VSFrameRef *src, MSmoothData *d, co
         blur3x3<T>(maskp[2], srcp[2], stride, width, height);
     }
 
-    int threshold = d->threshold ? d->threshold : (15 << (f->bitsPerSample - 8));
-    findEdges<T, rgb>((void **)maskp, stride, width, height, threshold, 0xffff >> (16 - f->bitsPerSample));
+    int maximum = 0xffff >> (16 - f->bitsPerSample);
+    int threshold = (int)((d->threshold * maximum) / 100);
+    threshold = clamp(threshold, 0, maximum);
+
+    findEdges<T, rgb>((void **)maskp, stride, width, height, threshold, maximum);
 
     if (rgb) {
         if (d->mask) {
@@ -573,7 +586,7 @@ static const VSFrameRef *VS_CC msmoothGetFrame(int n, int activationReason, void
         else
             smooth<uint16_t>(dst, src, mask, d, vsapi);
 
-        for (int i = 1; i < d->strength; i++) {
+        for (int i = 1; i < (int)(d->strength + 0.5); i++) {
             VSFrameRef *t = temp;
             temp = dst;
             dst = t;
@@ -586,6 +599,178 @@ static const VSFrameRef *VS_CC msmoothGetFrame(int n, int activationReason, void
         vsapi->freeFrame(src);
         vsapi->freeFrame(temp);
         vsapi->freeFrame(mask);
+
+        return dst;
+    }
+
+    return 0;
+}
+
+
+template <typename T>
+static inline void msharpenFindEdges(void *maskpv, const void *srcpv, int stride, int width, int height, int th, int maximum) {
+    T *maskp = (T *)maskpv;
+    const T *srcp = (const T *)srcpv;
+
+    stride /= sizeof(T);
+
+    for (int y = 0; y < height - 1; y++) {
+        for (int x = 0; x < width - 1; x++) {
+            int edge = abs(srcp[x] - srcp[x + stride + 1]) >= th ||
+                       abs(srcp[x + 1] - srcp[x + stride]) >= th ||
+                       abs(srcp[x] - srcp[x + 1]) >= th ||
+                       abs(srcp[x] - srcp[x + stride]) >= th;
+
+            if (edge)
+                maskp[x] = maximum;
+            else
+                maskp[x] = 0;
+        }
+
+        int edge = abs(srcp[width - 1] - srcp[width + stride - 1]) >= th;
+
+        if (edge)
+            maskp[width - 1] = maximum;
+        else
+            maskp[width - 1] = 0;
+
+        maskp += stride;
+        srcp += stride;
+    }
+
+    for (int x = 0; x < width - 1; x++) {
+        int edge = abs(srcp[x] - srcp[x + 1]) >= th;
+
+        if (edge)
+            maskp[x] = maximum;
+        else
+            maskp[x] = 0;
+    }
+
+    maskp[width - 1] = maximum;
+}
+
+
+template <typename T>
+static void msharpenEdgeMask(VSFrameRef *mask, VSFrameRef *blur, const VSFrameRef *src, MSmoothData *d, const VSAPI *vsapi) {
+    const uint8_t *srcp[3];
+    uint8_t *maskp[3];
+    uint8_t *blurp[3];
+    int width[3];
+    int height[3];
+    int stride[3];
+
+    const VSFormat *f = vsapi->getFrameFormat(src);
+
+    int maximum = 0xffff >> (16 - f->bitsPerSample);
+    int threshold = (int)((d->threshold * maximum) / 100);
+    threshold = clamp(threshold, 0, maximum);
+
+    for (int plane = 0; plane < f->numPlanes; plane++) {
+        if (!d->process[plane])
+            continue;
+
+        srcp[plane] = vsapi->getReadPtr(src, plane);
+        maskp[plane] = vsapi->getWritePtr(mask, plane);
+        blurp[plane] = vsapi->getWritePtr(blur, plane);
+
+        stride[plane] = vsapi->getStride(src, plane);
+
+        width[plane] = vsapi->getFrameWidth(src, plane);
+        height[plane] = vsapi->getFrameHeight(src, plane);
+
+        blur3x3<T>(blurp[plane], srcp[plane], stride[plane], width[plane], height[plane]);
+
+        msharpenFindEdges<T>(maskp[plane], blurp[plane], stride[plane], width[plane], height[plane], threshold, maximum);
+    }
+
+    if (f->colorFamily == cmRGB && d->process[0] && d->process[1] && d->process[2]) {
+        for (int x = 0; x < height[0] * stride[0]; x++)
+            maskp[0][x] = maskp[0][x] | maskp[1][x] | maskp[2][x];
+
+        memcpy(maskp[1], maskp[0], height[0] * stride[0]);
+        memcpy(maskp[2], maskp[0], height[0] * stride[0]);
+    }
+}
+
+
+template <typename T>
+static void sharpen(VSFrameRef *dst, const VSFrameRef *blur, const VSFrameRef *src, MSmoothData *d, const VSAPI *vsapi) {
+    const VSFormat *f = vsapi->getFrameFormat(src);
+
+    int maximum = 0xffff >> (16 - f->bitsPerSample);
+    int strength = (int)((d->strength * maximum) / 100);
+    strength = clamp(strength, 0, maximum);
+
+    int invstrength = maximum - strength;
+
+    for (int plane = 0; plane < f->numPlanes; plane++) {
+        if (!d->process[plane])
+            continue;
+
+        const T *srcp = (const T *)vsapi->getReadPtr(src, plane);
+        const T *blurp = (const T *)vsapi->getReadPtr(blur, plane);
+        T *dstp = (T *)vsapi->getWritePtr(dst, plane);
+
+        int stride = vsapi->getStride(src, plane);
+        int width = vsapi->getFrameWidth(src, plane);
+        int height = vsapi->getFrameHeight(src, plane);
+
+        stride /= sizeof(T);
+
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                if (dstp[x]) {
+                    int tmp = 4 * srcp[x] - 3 * blurp[x];
+                    tmp = clamp(tmp, 0, maximum);
+
+                    dstp[x] = (strength * tmp + invstrength * srcp[x]) >> f->bitsPerSample;
+                } else {
+                    dstp[x] = srcp[x];
+                }
+            }
+
+            srcp += stride;
+            dstp += stride;
+            blurp += stride;
+        }
+    }
+}
+
+
+static const VSFrameRef *VS_CC msharpenGetFrame(int n, int activationReason, void **instanceData, void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+    MSmoothData *d = (MSmoothData *) * instanceData;
+
+    if (activationReason == arInitial) {
+        vsapi->requestFrameFilter(n, d->node, frameCtx);
+    } else if (activationReason == arAllFramesReady) {
+        const VSFrameRef *src = vsapi->getFrameFilter(n, d->node, frameCtx);
+
+        const VSFormat *f = vsapi->getFrameFormat(src);
+
+        if (f->bytesPerSample > 2 || f->sampleType != stInteger)
+            return src;
+
+        int width = vsapi->getFrameWidth(src, 0);
+        int height = vsapi->getFrameHeight(src, 0);
+
+        VSFrameRef *blur = vsapi->newVideoFrame(f, width, height, NULL, core);
+        VSFrameRef *dst = vsapi->newVideoFrame(f, width, height, src, core);
+
+        if (f->bitsPerSample == 8)
+            msharpenEdgeMask<uint8_t>(dst, blur, src, d, vsapi);
+        else
+            msharpenEdgeMask<uint16_t>(dst, blur, src, d, vsapi);
+
+        if (!d->mask) {
+            if (f->bitsPerSample == 8)
+                sharpen<uint8_t>(dst, blur, src, d, vsapi);
+            else
+                sharpen<uint16_t>(dst, blur, src, d, vsapi);
+        }
+
+        vsapi->freeFrame(src);
+        vsapi->freeFrame(blur);
 
         return dst;
     }
@@ -609,9 +794,12 @@ static void VS_CC msmoothCreate(const VSMap *in, VSMap *out, void *userData, VSC
     int err;
     int i, m, n, o;
 
-    d.threshold = vsapi->propGetInt(in, "threshold", 0, &err);
-    if (!err && (d.threshold < 1 || d.threshold > 65535)) {
-        vsapi->setError(out, "MSmooth: threshold must be between 1 and 65535 (inclusive).");
+    d.threshold = vsapi->propGetFloat(in, "threshold", 0, &err);
+    if (err)
+        d.threshold = 6;
+
+    if (d.threshold < 0.0 || d.threshold > 100.0) {
+        vsapi->setError(out, "MSmooth: threshold must be between 0 and 100 %.");
         return;
     }
 
@@ -661,13 +849,82 @@ static void VS_CC msmoothCreate(const VSMap *in, VSMap *out, void *userData, VSC
 }
 
 
+static void VS_CC msharpenCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
+    MSmoothData d;
+    MSmoothData *data;
+
+    int err;
+    int i, m, n, o;
+
+    d.threshold = vsapi->propGetFloat(in, "threshold", 0, &err);
+    if (err)
+        d.threshold = 6.0;
+
+    d.strength = vsapi->propGetFloat(in, "strength", 0, &err);
+    if (err)
+        d.strength = 39.0;
+
+    d.mask = !!vsapi->propGetInt(in, "mask", 0, &err);
+
+    if (d.threshold < 0.0 || d.threshold > 100.0) {
+        vsapi->setError(out, "MSharpen: threshold must be between 0 and 100 %.");
+        return;
+    }
+
+    if (d.strength < 0.0 || d.strength > 100.0) {
+        vsapi->setError(out, "MSharpen: strength must be between 0 and 100 %.");
+        return;
+    }
+
+    d.node = vsapi->propGetNode(in, "clip", 0, 0);
+    d.vi = vsapi->getVideoInfo(d.node);
+
+    n = 3;
+    m = vsapi->propNumElements(in, "planes");
+
+    for (i = 0; i < 3; i++)
+        d.process[i] = (m <= 0);
+
+    for (i = 0; i < m; i++) {
+        o = vsapi->propGetInt(in, "planes", i, 0);
+
+        if (o < 0 || o >= n) {
+            vsapi->setError(out, "MSharpen: Plane index out of range.");
+            vsapi->freeNode(d.node);
+            return;
+        }
+
+        if (d.process[o]) {
+            vsapi->setError(out, "MSharpen: Plane specified twice.");
+            vsapi->freeNode(d.node);
+            return;
+        }
+
+        d.process[o] = 1;
+    }
+
+
+    data = (MSmoothData *)malloc(sizeof(d));
+    *data = d;
+
+    vsapi->createFilter(in, out, "MSharpen", msmoothInit, msharpenGetFrame, msmoothFree, fmParallel, 0, data, core);
+}
+
+
 VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegisterFunction registerFunc, VSPlugin *plugin) {
-    configFunc("com.nodame.msmooth", "msmooth", "Spatial smoother with edge masking", VAPOURSYNTH_API_VERSION, 1, plugin);
+    configFunc("com.nodame.msmoosh", "msmoosh", "MSmooth and MSharpen", VAPOURSYNTH_API_VERSION, 1, plugin);
     registerFunc("MSmooth",
                  "clip:clip;"
-                 "threshold:int:opt;"
+                 "threshold:float:opt;"
                  "strength:int:opt;"
                  "mask:int:opt;"
                  "planes:int[]:opt;"
                  , msmoothCreate, 0, plugin);
+    registerFunc("MSharpen",
+                 "clip:clip;"
+                 "threshold:float:opt;"
+                 "strength:float:opt;"
+                 "mask:int:opt;"
+                 "planes:int[]:opt;"
+                 , msharpenCreate, 0, plugin);
 }
