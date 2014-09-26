@@ -578,8 +578,11 @@ static const VSFrameRef *VS_CC msmoothGetFrame(int n, int activationReason, void
             return mask;
         }
 
-        VSFrameRef *temp = vsapi->newVideoFrame(f, width, height, src, core);
-        VSFrameRef *dst = vsapi->newVideoFrame(f, width, height, src, core);
+        const VSFrameRef *frames[3] = { d->process[0] ? NULL : src, d->process[1] ? NULL : src, d->process[2] ? NULL : src };
+        const int planes[3] = { 0, 1, 2 };
+
+        VSFrameRef *temp = vsapi->newVideoFrame2(f, width, height, frames, planes, src, core);
+        VSFrameRef *dst = vsapi->newVideoFrame2(f, width, height, frames, planes, src, core);
 
         if (f->bitsPerSample == 8)
             smooth<uint8_t>(dst, src, mask, d, vsapi);
@@ -755,7 +758,11 @@ static const VSFrameRef *VS_CC msharpenGetFrame(int n, int activationReason, voi
         int height = vsapi->getFrameHeight(src, 0);
 
         VSFrameRef *blur = vsapi->newVideoFrame(f, width, height, NULL, core);
-        VSFrameRef *dst = vsapi->newVideoFrame(f, width, height, src, core);
+
+        const VSFrameRef *frames[3] = { d->process[0] ? NULL : src, d->process[1] ? NULL : src, d->process[2] ? NULL : src };
+        const int planes[3] = { 0, 1, 2 };
+
+        VSFrameRef *dst = vsapi->newVideoFrame2(f, width, height, frames, planes, src, core);
 
         if (f->bitsPerSample == 8)
             msharpenEdgeMask<uint8_t>(dst, blur, src, d, vsapi);
